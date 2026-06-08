@@ -1,0 +1,37 @@
+// For format details, see https://aka.ms/devcontainer.json.
+{
+  "name": "RTOS Scheduler",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "workspaceFolder": "/workspaces/rtos-scheduler",
+  // Runs on the HOST before the container starts
+  "initializeCommand": "sh -c 'mkdir -p $HOME/.claude $HOME/.gemini && touch $HOME/.claude.json'",
+  "features": {
+	"ghcr.io/devcontainers/features/node:1": {},
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cpptools-extension-pack",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+        "redhat.vscode-yaml",
+        "google.gemini-vscode"
+      ],
+      "settings": {
+        "C_Cpp.default.compilerPath": "/usr/bin/g++"
+      }
+    }
+  },
+  "mounts": [
+    // Auth & Config Bind Mounts
+    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.claude.json,target=/home/vscode/.claude.json,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.gemini,target=/home/vscode/.gemini,type=bind,consistency=cached"
+  ],
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true
+}
