@@ -23,20 +23,27 @@ A single-threaded deterministic tick engine simulating an RTOS kernel. No host O
 
 ### Key design points
 
-- **TCB (Task Control Block)** — the complete task snapshot. Contains `state`, `original_priority`, `effective_priority`, `quantum_remaining`, `sleep_ticks_remaining`, and intrusive list pointers (`next`/`prev`). No side-tables anywhere in the scheduler.
+- **TCB (Task Control Block)** — the complete task snapshot. Contains `state`, `original_priority`, `effective_priority`, `quantum_remaining`, `sleep_ticks_remaining`, `waiting_on_` (`Resource*`), `held_resources_` (`uint32_t` bitmask), and intrusive list pointers (`next`/`prev`). No side-tables anywhere in the kernel.
 - **Intrusive linked lists** — `next`/`prev` live inside each TCB, enabling O(1) insert/remove without allocation.
-- **State ownership** — the kernel (Scheduler) is the sole authority on task state transitions. Tasks never set their own state.
-- **`TaskInterface` / `KernelContext`** — tasks implement `execute_one_tick(KernelContext& ctx)` returning `TickResult` (`CONTINUE`, `DONE`, `BLOCKED`). All kernel calls go through `KernelContext`; tasks have no direct scheduler access.
+- **State ownership** — the kernel is the sole authority on task state transitions. Tasks never set their own state.
+- **`TaskInterface` / `KernelContext`** — tasks implement `bool execute_one_tick(KernelContext& ctx)`. Returns `true` when complete, `false` otherwise. All kernel calls go through `KernelContext`; tasks have no direct kernel access. Kernel reads context after every tick to determine state transitions.
+- **`KernelIntent`** — context carries one intent + `int value` per tick (`NONE`, `SLEEP`, `ACQUIRE`, `YIELD`). Double context calls within a single tick trigger an assert.
+- **Acquire fast path** — if a resource is free, it is granted immediately within the same tick and no intent is set. Intent is only set on the contended path.
+- **Release** — immediate direct action. Kernel calls `resource.release_and_get_waiter()` and wakes the returned TCB directly. No intent, no deferred processing.
+- **Resource ownership** — kernel owns all resources. Tasks identify them by `ResourceId` enum and access them exclusively through `KernelContext`.
+- **Abstract `Resource` base class** — `get_owner()` and `release_and_get_waiter()` enable polymorphic handling across `MemoryPool`, `Mutex`, etc.
 - **Ready queue** — array of 5 intrusive list heads, one per priority level. Highest non-empty level runs first (O(1)).
-- **`BlockedTasksList`** — scheduler-owned list for timer-sleep only. Resource-blocked tasks live in the resource's own private wait queue.
+- **`BlockedTasksList`** — kernel-owned list for timer-sleep only. Resource-blocked tasks live in the resource's own private wait queue.
 - **`BLOCKED` state disambiguation** — single enum value; check `sleep_ticks_remaining > 0` to distinguish sleep from resource wait.
-- **Priority inheritance** — `effective_priority` is elevated when a higher-priority task blocks on a resource held by a lower-priority task; restored on release. Chains transitively.
-- **Per-resource wait queues** — resources (e.g. `MemoryPool`, `Mutex`) own their wait queues and directly hand off to the head waiter on release, preventing thundering herd.
+- **`waiting_on_`** — `Resource*` on TCB set by the resource when enqueuing a task. Enables O(1) transitive priority inheritance chain traversal. Cleared by the resource on handoff.
+- **`held_resources_`** — `uint32_t` bitmask on TCB. Scanned on task completion for force-release of any unreleased resources.
+- **Priority inheritance** — `effective_priority` is elevated when a higher-priority task blocks on a resource held by a lower-priority task; restored on release. Chains transitively via `waiting_on_`.
+- **Per-resource wait queues** — resources own their wait queues and hand off directly to the head waiter on release, preventing thundering herd.
 
 ### Roadmap phases
 
-1. **Phase 1** — TCB, enums, `TaskInterface`, `KernelContext`, `IntrusiveLinkedList`, `TaskPool`, Scheduler skeleton
-2. **Phase 2** — Tick engine, ready queue, round-robin (quantum = 3), sleep countdown, `TickResult` dispatch
+1. **Phase 1** — TCB, enums, `TaskInterface`, `KernelContext`, `KernelIntent`, abstract `Resource`, `IntrusiveLinkedList`, `TaskPool`, Kernel skeleton
+2. **Phase 2** — Tick engine, ready queue, round-robin (quantum = 3), sleep countdown, `KernelIntent` dispatch
 3. **Phase 3** — `MemoryPool`, resource wait queues, `BLOCKED`→`READY` transitions, event log ring buffer
 4. **Phase 4** — `Mutex`, Mars Pathfinder priority inversion scenario, transitive priority inheritance
 

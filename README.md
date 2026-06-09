@@ -1,4 +1,4 @@
-# C++ RTOS Scheduler Simulator
+# C++ RTOS Kernel Simulator
 
 A deterministic, software-based simulator designed to model Real-Time Operating System (RTOS) task scheduling, resource management, and core kernel mechanics without relying on host OS concurrency primitives.
 
@@ -28,6 +28,8 @@ The TCB is the complete snapshot of a task's existence. Every field needed to de
 | `effective_priority` | `int` | Elevated during priority inheritance, otherwise equals `original_priority` |
 | `quantum_remaining` | `int` | Ticks remaining before round-robin preemption |
 | `sleep_ticks_remaining` | `int` | Ticks remaining before waking from sleep |
+| `waiting_on_` | `Resource*` | Pointer to the resource this task is blocked on — enables O(1) transitive priority inheritance traversal. Null when not resource-blocked |
+| `held_resources_` | `uint32_t` | Bitmask of currently held resource IDs (bit position = `ResourceId` value). Scanned on task completion to force-release any unreleased resources |
 | `next` | `TCB*` | Intrusive list forward pointer |
 | `prev` | `TCB*` | Intrusive list backward pointer |
 | `task` | `TaskInterface*` | Pointer to the polymorphic task implementation |
@@ -64,41 +66,50 @@ An **inactive pool** tracks which slots are unassigned and available for spawnin
 
 ### 3. TaskInterface & KernelContext
 
-Application tasks inherit from an abstract `TaskInterface` base class and execute as bounded state machines. Each tick, the scheduler calls:
+Application tasks inherit from an abstract `TaskInterface` base class and execute as bounded state machines. Each tick, the kernel calls:
 
 ```cpp
-TickResult execute_one_tick(KernelContext& ctx);
+bool execute_one_tick(KernelContext& ctx);
 ```
 
-`KernelContext` is a thin kernel API layer owned by the scheduler. Tasks interact with kernel services exclusively through it — no global state, no direct scheduler access. This mirrors how real RTOS tasks call kernel API functions (e.g. `vTaskDelay`, `xSemaphoreTake` in FreeRTOS).
+Returns `true` when the task is complete, `false` otherwise. The kernel determines the task's next state by reading `KernelContext` after the tick — the task never sets its own state.
+
+`KernelContext` is a thin kernel API layer owned by the kernel. Tasks interact with kernel services exclusively through it — no global state, no direct kernel access. This mirrors how real RTOS tasks call kernel API functions (e.g. `vTaskDelay`, `xSemaphoreTake` in FreeRTOS). The kernel sets `ctx.current_tcb_` before each tick so the context knows which task is active.
 
 ```cpp
-// Example kernel services exposed via KernelContext
-ctx.sleep(N);           // Block for N ticks
-ctx.acquire(pool);      // Request a memory block
-ctx.acquire(mutex);     // Acquire a mutex
+ctx.sleep(N);                    // Block for N ticks — always sets intent
+ctx.acquire_memory(MEMORY_A);    // Request memory block — fast path if free, intent if contended
+ctx.acquire_mutex(MUTEX_A);      // Acquire mutex — fast path if free, intent if contended
+ctx.release(MUTEX_A);            // Release resource — immediate direct action, no intent
+ctx.yield();                     // Yield remaining quantum — always sets intent
 ```
 
-`execute_one_tick()` returns a `TickResult` enum expressing the task's intent. The kernel acts on it:
+Context carries one `KernelIntent` per tick. Calling a second context method in the same tick is a programming error and triggers an assert. Sequential operations are handled across ticks via the task's own phase state machine.
 
-| Return Value | Meaning | Kernel Action |
+| `KernelIntent` | Value | Kernel Action |
 |---|---|---|
-| `CONTINUE` | Still working | Decrement quantum, round-robin if expired |
-| `DONE` | Execution complete | Reset TCB, set state → `INACTIVE`, return slot to inactive pool |
-| `BLOCKED` | Waiting on resource or sleep | Remove from ready list, add to appropriate wait queue |
+| `NONE` | — | Task still working — decrement quantum, round-robin if expired |
+| `SLEEP` | N (ticks) | Set `sleep_ticks_remaining = N`, transition to `BLOCKED` |
+| `ACQUIRE` | `ResourceId` | Resource was contended — transition to `BLOCKED`, task already enqueued on resource wait queue |
+| `YIELD` | — | Reset quantum, move task to tail of its priority level |
+
+**Acquire fast path:** if the requested resource is free, it is granted immediately within the same tick — no intent is set, no tick is wasted. Intent is only set on the contended path.
+
+**Release:** always immediate. The kernel calls `resource.release_and_get_waiter()`, receives the next waiting `TCB*` (or null), and calls `wake_task()` to transition that task to `READY` and insert it into the ready queue. The releasing task continues its tick uninterrupted.
 
 ---
 
-### 4. Scheduler Engine
+### 4. Kernel Engine
 
-The scheduler is the traffic controller. It contains:
+The kernel is the sole authority on task state transitions. It contains:
 
 - **Ready Queue** — an array of `NUM_PRIORITY_LEVELS` (= 5) intrusive list heads, one per priority level. Always evaluates the highest non-empty level first for O(1) priority access.
-- **BlockedTasksList** — a global intrusive list of TCBs sleeping via `ctx.sleep(N)`. Each tick the scheduler decrements `sleep_ticks_remaining` for each entry and moves tasks back to the ready queue when it reaches zero. Tasks blocked on resources are tracked by those resources' own private wait queues, not here.
+- **BlockedTasksList** — a global intrusive list of TCBs sleeping via `ctx.sleep(N)`. Each tick the kernel decrements `sleep_ticks_remaining` for each entry and moves tasks back to the ready queue when it reaches zero. Tasks blocked on resources are tracked by those resources' own private wait queues, not here.
+- **Resource Registry** — the kernel owns all resources (`MemoryPool`, `Mutex` etc.). Tasks identify resources by `ResourceId` enum and interact with them exclusively through `KernelContext`. `ResourceId` values are explicit sequential integers enabling O(1) bitmask operations.
 
 #### Round-Robin
 
-When a task's `quantum_remaining` hits zero, the scheduler detaches it from the front of its priority list and appends it to the tail, then resets `quantum_remaining` to `DEFAULT_QUANTUM` (= 3). Tasks at the same priority level share CPU time fairly.
+When a task's `quantum_remaining` hits zero, the kernel detaches it from the front of its priority list and appends it to the tail, then resets `quantum_remaining` to `DEFAULT_QUANTUM` (= 3). Tasks at the same priority level share CPU time fairly.
 
 #### Preemption
 
@@ -106,15 +117,29 @@ If a task transitions from `BLOCKED` → `READY` and its `effective_priority` is
 
 ---
 
-### 5. Memory Pool
+### 5. Resource Base Class
+
+All kernel resources (`MemoryPool`, `Mutex`) inherit from an abstract `Resource` base class:
+
+```cpp
+class Resource {
+public:
+    virtual TCB* get_owner() const = 0;
+    virtual TCB* release_and_get_waiter() = 0;
+};
+```
+
+This enables O(1) transitive priority inheritance traversal via `TCB::waiting_on_` without the kernel needing to know the concrete resource type.
+
+### 6. Memory Pool
 
 Simulates deterministic memory allocation. Manages a fixed count of block units and owns a **private wait queue** of blocked `TCB*` pointers.
 
-When a block is freed, the pool bypasses any global broadcast and directly hands the resource to the TCB at the front of its wait queue, transitioning that task's state to `READY` and signalling the scheduler. This eliminates the "Thundering Herd" problem.
+When a block is freed, `release_and_get_waiter()` returns the head waiter directly to the kernel, which transitions that task to `READY`. This bypasses any global broadcast and eliminates the "Thundering Herd" problem.
 
 ---
 
-### 6. Tick Engine
+### 7. Tick Engine
 
 A single-threaded loop acting as the virtual CPU:
 
@@ -130,7 +155,7 @@ Each iteration represents one logical tick. Tasks are state machines — `execut
 
 ---
 
-### 7. Event Log
+### 8. Event Log
 
 A ring buffer of structured tick events, capturing task state transitions, resource acquisitions, preemptions, and round-robin cycles. Built in from the start to support debugging and correctness verification.
 
@@ -155,13 +180,21 @@ The Mars Pathfinder priority inversion bug is used in Phase 4 as a concrete vali
 | Dynamic allocation | Banned after startup — all structures pre-allocated |
 | Intrusive lists | `next`/`prev` pointers inside TCB for O(1) insert/remove |
 | State ownership | Kernel owns all transitions — tasks never set own state |
-| Task-kernel interface | `execute_one_tick(KernelContext& ctx)` |
-| `TickResult` | Enum: `CONTINUE`, `DONE`, `BLOCKED` |
+| Task-kernel interface | `bool execute_one_tick(KernelContext& ctx)` — `true` = done |
+| Task→kernel communication | `KernelIntent` enum + `int value` on `KernelContext`, read after each tick |
+| Acquire fast path | Resource free → granted same tick, no intent set. Contended → intent set, task blocked |
+| Release | Immediate direct action — `resource.release_and_get_waiter()` → kernel calls `wake_task()` |
+| Resource ownership | Kernel owns all resources. Tasks identify by `ResourceId` enum, interact via `KernelContext` |
+| Resource base class | Abstract `Resource` with `get_owner()` and `release_and_get_waiter()` |
 | Priority levels | `constexpr NUM_PRIORITY_LEVELS = 5` |
-| Time quantum | `constexpr DEFAULT_QUANTUM = 3`, counter stored in TCB |
+| Time quantum | `constexpr DEFAULT_QUANTUM = 3`, reset on wake, counter stored in TCB |
 | BLOCKED distinction | Single state — check `sleep_ticks_remaining > 0` to distinguish sleep vs. resource wait |
-| Global BlockedTasksList | Retained in scheduler for timer-based sleep only |
+| Global BlockedTasksList | Retained in kernel for timer-based sleep only |
 | Per-resource wait queues | Resources own their wait queues — no thundering herd |
+| `waiting_on_` | `Resource*` on TCB — enables O(1) transitive priority inheritance traversal |
+| `held_resources_` | `uint32_t` bitmask on TCB — force-release scan on task completion |
+| Double context call | Assert — one `KernelIntent` per tick enforced at boundary |
+| Re-acquire guard | No-op if task already owns resource |
 | Pool sizes | All `constexpr` at compile time |
 | Termination | All tasks `INACTIVE` or `MAX_TICKS` safety cap reached |
 
@@ -170,19 +203,20 @@ The Mars Pathfinder priority inversion bug is used in Phase 4 as a concrete vali
 ## Project Roadmap
 
 ### Phase 1: Foundations & Static Layout
-- Implement the `TCB` struct with all fields
-- Define the `TaskState` enum and `TickResult` enum
+- Implement the `TCB` struct with all fields including `waiting_on_` and `held_resources_`
+- Define the `TaskState` and `ResourceId` enums
 - Author `TaskInterface` abstract base class and `KernelContext` API layer
+- Author the abstract `Resource` base class
 - Author the `IntrusiveLinkedList` class managing raw `TCB*` pointer manipulation
 - Build the `TaskPool` with inactive slot tracking
-- Initialize the structural memory footprint of the `Scheduler`
+- Initialize the structural memory footprint of the `Kernel`
 
 ### Phase 2: Core Tick Loop & Scheduling
 - Construct the main `while(sim_running)` tick engine
-- Build the priority-level ready queue array inside the `Scheduler`
+- Build the priority-level ready queue array inside the `Kernel`
 - Implement round-robin decrement and preemption logic
 - Implement `BlockedTasksList` with per-tick sleep countdown
-- Wire up the `KernelContext` and `TickResult` dispatch
+- Wire up `KernelContext` intent dispatch and `bool` return handling
 
 ### Phase 3: Resource Blocking Mechanics
 - Design a deterministic `MemoryPool` with static block tracking
