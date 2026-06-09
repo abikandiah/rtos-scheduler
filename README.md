@@ -37,13 +37,12 @@ The TCB is the complete snapshot of a task's existence. Every field needed to de
 A TCB moves through a strict set of states. The kernel owns all transitions — a task never sets its own state.
 
 ```
+         ┌────────────(done)────────────┐
+         │                             ▼
 INACTIVE ──►(spawn)──► READY ◄──(wake)── BLOCKED
                          │                   ▲
                          ▼(schedule)          │
                        RUNNING ──(block)──────┘
-                         │
-                         ▼(done)
-                      TERMINATED
 ```
 
 | State | Description |
@@ -52,7 +51,6 @@ INACTIVE ──►(spawn)──► READY ◄──(wake)── BLOCKED
 | `READY` | Enqueued in a priority list, waiting for CPU time |
 | `RUNNING` | Currently executing — `execute_one_tick()` is being called |
 | `BLOCKED` | Waiting on a resource (in a resource's wait queue) or sleeping (in the scheduler's BlockedTasksList). Distinguish by checking `sleep_ticks_remaining > 0` |
-| `TERMINATED` | Execution complete |
 
 ---
 
@@ -86,7 +84,7 @@ ctx.acquire(mutex);     // Acquire a mutex
 | Return Value | Meaning | Kernel Action |
 |---|---|---|
 | `CONTINUE` | Still working | Decrement quantum, round-robin if expired |
-| `DONE` | Execution complete | Set state → `TERMINATED` |
+| `DONE` | Execution complete | Reset TCB, set state → `INACTIVE`, return slot to inactive pool |
 | `BLOCKED` | Waiting on resource or sleep | Remove from ready list, add to appropriate wait queue |
 
 ---
@@ -124,7 +122,7 @@ A single-threaded loop acting as the virtual CPU:
 while (sim_running && current_tick < MAX_TICKS) {
     tick();
     current_tick++;
-    if (all_tasks_terminated()) sim_running = false;
+    if (all_tasks_inactive()) sim_running = false;
 }
 ```
 
@@ -165,7 +163,7 @@ The Mars Pathfinder priority inversion bug is used in Phase 4 as a concrete vali
 | Global BlockedTasksList | Retained in scheduler for timer-based sleep only |
 | Per-resource wait queues | Resources own their wait queues — no thundering herd |
 | Pool sizes | All `constexpr` at compile time |
-| Termination | All tasks `TERMINATED` or `MAX_TICKS` safety cap reached |
+| Termination | All tasks `INACTIVE` or `MAX_TICKS` safety cap reached |
 
 ---
 
