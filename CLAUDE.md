@@ -23,7 +23,7 @@ A single-threaded deterministic tick engine simulating an RTOS kernel. No host O
 
 ### Key design points
 
-- **TCB (Task Control Block)** — the complete task snapshot. Contains `state`, `original_priority`, `effective_priority`, `quantum_remaining`, `sleep_ticks_remaining`, `waiting_on_` (`Resource*`), `held_resources_` (`uint32_t` bitmask), and intrusive list pointers (`next`/`prev`). No side-tables anywhere in the kernel.
+- **TCB (Task Control Block)** — the complete task snapshot. Contains `state`, `original_priority`, `effective_priority`, `quantum_remaining`, `sleep_ticks_remaining`, `waiting_on` (`Resource*`), `held_resources` (`uint32_t` bitmask), and intrusive list pointers (`next`/`prev`). No side-tables anywhere in the kernel. All fields public — TCB is a `struct`, no trailing underscores.
 - **Intrusive linked lists** — `next`/`prev` live inside each TCB, enabling O(1) insert/remove without allocation.
 - **State ownership** — the kernel is the sole authority on task state transitions. Tasks never set their own state.
 - **`TaskInterface` / `KernelContext`** — tasks implement `bool execute_one_tick(KernelContext& ctx)`. Returns `true` when complete, `false` otherwise. All kernel calls go through `KernelContext`; tasks have no direct kernel access. Kernel reads context after every tick to determine state transitions.
@@ -31,13 +31,15 @@ A single-threaded deterministic tick engine simulating an RTOS kernel. No host O
 - **Acquire fast path** — if a resource is free, it is granted immediately within the same tick and no intent is set. Intent is only set on the contended path.
 - **Release** — immediate direct action. Kernel calls `resource.release_and_get_waiter()` and wakes the returned TCB directly. No intent, no deferred processing.
 - **Resource ownership** — kernel owns all resources. Tasks identify them by `ResourceId` enum and access them exclusively through `KernelContext`.
-- **Abstract `Resource` base class** — `get_owner()` and `release_and_get_waiter()` enable polymorphic handling across `MemoryPool`, `Mutex`, etc.
+- **Abstract `Resource` base class** — Template Method pattern. `release_and_get_waiter(TCB* releasing_task)` is non-virtual shared logic (pops wait queue, calls `on_handoff()`). `on_handoff()` is pure virtual — `Mutex` clears its owner, `MemoryPool` finds the freed block via `block_owners` and assigns it to the waiter. `releasing_task` sourced from `ctx.current_tcb` in the kernel. `get_owner()` meaningful for `Mutex` only — `MemoryPool` returns `nullptr`.
 - **Ready queue** — array of 5 intrusive list heads, one per priority level. Highest non-empty level runs first (O(1)).
 - **`BlockedTasksList`** — kernel-owned list for timer-sleep only. Resource-blocked tasks live in the resource's own private wait queue.
 - **`BLOCKED` state disambiguation** — single enum value; check `sleep_ticks_remaining > 0` to distinguish sleep from resource wait.
-- **`waiting_on_`** — `Resource*` on TCB set by the resource when enqueuing a task. Enables O(1) transitive priority inheritance chain traversal. Cleared by the resource on handoff.
-- **`held_resources_`** — `uint32_t` bitmask on TCB. Scanned on task completion for force-release of any unreleased resources.
-- **Priority inheritance** — `effective_priority` is elevated when a higher-priority task blocks on a resource held by a lower-priority task; restored on release. Chains transitively via `waiting_on_`.
+- **`waiting_on`** — `Resource*` on TCB set by the resource when enqueuing a task. Enables O(1) transitive priority inheritance chain traversal. Cleared by the resource on handoff.
+- **`held_resources`** — `uint32_t` bitmask on TCB. Scanned on task completion for force-release of any unreleased resources.
+- **Priority inheritance** — `effective_priority` is elevated when a higher-priority task blocks on a `Mutex` held by a lower-priority task; restored on release. Chains transitively via `waiting_on`. Applies to `Mutex` only — `MemoryPool` has no single owner.
+- **`MemoryPool` ownership** — tracked per-block via `TCB* block_owners[BLOCK_COUNT]`. Pool-level `get_owner()` returns `nullptr`.
+- **Static storage** — `Kernel` declared `static` or global so pool buffers live in BSS/data segment, not the stack.
 - **Per-resource wait queues** — resources own their wait queues and hand off directly to the head waiter on release, preventing thundering herd.
 
 ### Roadmap phases

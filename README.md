@@ -119,23 +119,36 @@ If a task transitions from `BLOCKED` → `READY` and its `effective_priority` is
 
 ### 5. Resource Base Class
 
-All kernel resources (`MemoryPool`, `Mutex`) inherit from an abstract `Resource` base class:
+All kernel resources (`MemoryPool`, `Mutex`) inherit from an abstract `Resource` base class using the **Template Method pattern**:
 
 ```cpp
 class Resource {
 public:
+    TCB* release_and_get_waiter(TCB* releasing_task);  // non-virtual, shared logic
     virtual TCB* get_owner() const = 0;
-    virtual TCB* release_and_get_waiter() = 0;
+
+protected:
+    virtual void on_handoff(TCB* releasing_task, TCB* new_owner) = 0;  // resource-specific
+    IntrusiveLinkedList wait_queue_;
 };
 ```
 
-This enables O(1) transitive priority inheritance traversal via `TCB::waiting_on_` without the kernel needing to know the concrete resource type.
+`release_and_get_waiter(TCB* releasing_task)` is non-virtual — it pops the head waiter from the shared wait queue and calls `on_handoff()` for resource-specific ownership transfer. The releasing task is passed in (sourced from `ctx.current_tcb` in the kernel) so each resource can identify what is being released:
+
+- `Mutex::on_handoff` — clears `owner_`, ignores `releasing_task`
+- `MemoryPool::on_handoff` — scans `block_owners` for `releasing_task`, frees that block, assigns it to `new_owner`
+
+`get_owner()` is meaningful for `Mutex` only and enables O(1) transitive priority inheritance chain traversal via `TCB::waiting_on`. For `MemoryPool`, ownership is per-block — `get_owner()` returns `nullptr`. Priority inheritance therefore applies to `Mutex` only.
 
 ### 6. Memory Pool
 
-Simulates deterministic memory allocation. Manages a fixed count of block units and owns a **private wait queue** of blocked `TCB*` pointers.
+Simulates deterministic memory allocation. Fixed block size and block count are `constexpr` — the compiler determines the memory footprint at compile time. The buffer is a 2D array (`uint8_t buffer[BLOCK_COUNT][BLOCK_SIZE]`) stored as a member — no heap allocation.
 
-When a block is freed, `release_and_get_waiter()` returns the head waiter directly to the kernel, which transitions that task to `READY`. This bypasses any global broadcast and eliminates the "Thundering Herd" problem.
+Ownership is tracked **per block**, not per pool: `TCB* block_owners[BLOCK_COUNT]`, null when free. A free bitmask enables O(1) block search. The pool owns a **private wait queue** of blocked `TCB*` pointers for tasks waiting on any free block.
+
+When a block is freed, `release_and_get_waiter(releasing_task)` identifies the freed block via `block_owners`, assigns it to the head waiter in `on_handoff`, and returns that waiter to the kernel, which transitions it to `READY`. This bypasses any global broadcast and eliminates the "Thundering Herd" problem.
+
+**Storage:** the `Kernel` object (and therefore all pools it owns) must be declared `static` or global — not as a local variable in `main`. This moves the buffer out of the stack into the BSS/data segment, which is necessary for large block sizes (e.g. network packet buffers) and mirrors how embedded systems manage pre-allocated memory.
 
 ---
 
@@ -165,7 +178,7 @@ A ring buffer of structured tick events, capturing task state transitions, resou
 
 A classic failure in priority-based schedulers is **priority inversion**: a low-priority task holds a resource needed by a high-priority task, but gets starved by an intermediate task.
 
-The simulator defends against this with **Priority Inheritance**. When a high-priority task blocks on a resource, the scheduler elevates `effective_priority` of the holding task to match. On release, `effective_priority` is restored to `original_priority`.
+The simulator defends against this with **Priority Inheritance**. When a high-priority task blocks on a `Mutex`, the kernel elevates `effective_priority` of the holding task to match. On release, `effective_priority` is restored to `original_priority`. Priority inheritance applies to `Mutex` only — `MemoryPool` has no single owner to elevate.
 
 Both fields live in the TCB from day one. Inheritance can chain transitively — if task C holds resource 1 and also blocks on resource 2 held by task D, the elevation propagates through the chain.
 
@@ -185,14 +198,18 @@ The Mars Pathfinder priority inversion bug is used in Phase 4 as a concrete vali
 | Acquire fast path | Resource free → granted same tick, no intent set. Contended → intent set, task blocked |
 | Release | Immediate direct action — `resource.release_and_get_waiter()` → kernel calls `wake_task()` |
 | Resource ownership | Kernel owns all resources. Tasks identify by `ResourceId` enum, interact via `KernelContext` |
-| Resource base class | Abstract `Resource` with `get_owner()` and `release_and_get_waiter()` |
+| Resource base class | Template Method pattern — `release_and_get_waiter(TCB*)` non-virtual shared logic, `on_handoff()` pure virtual per resource. `get_owner()` meaningful for `Mutex` only |
 | Priority levels | `constexpr NUM_PRIORITY_LEVELS = 5` |
 | Time quantum | `constexpr DEFAULT_QUANTUM = 3`, reset on wake, counter stored in TCB |
 | BLOCKED distinction | Single state — check `sleep_ticks_remaining > 0` to distinguish sleep vs. resource wait |
 | Global BlockedTasksList | Retained in kernel for timer-based sleep only |
 | Per-resource wait queues | Resources own their wait queues — no thundering herd |
-| `waiting_on_` | `Resource*` on TCB — enables O(1) transitive priority inheritance traversal |
-| `held_resources_` | `uint32_t` bitmask on TCB — force-release scan on task completion |
+| `waiting_on` | `Resource*` on TCB — enables O(1) transitive priority inheritance traversal (Mutex chain only) |
+| `held_resources` | `uint32_t` bitmask on TCB — force-release scan on task completion |
+| TCB field naming | No trailing underscores — TCB is a `struct` (public data). Trailing underscores reserved for private class members |
+| `Kernel` storage | Declared `static` or global — keeps large pool buffers off the stack in BSS/data segment |
+| Priority inheritance scope | `Mutex` only — `MemoryPool` has no single owner, inheritance does not apply |
+| `MemoryPool` ownership | Per-block `TCB* block_owners[BLOCK_COUNT]`, not pool-level. Pool-level `get_owner()` returns `nullptr` |
 | Double context call | Assert — one `KernelIntent` per tick enforced at boundary |
 | Re-acquire guard | No-op if task already owns resource |
 | Pool sizes | All `constexpr` at compile time |
