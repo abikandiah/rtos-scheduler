@@ -3,75 +3,66 @@
 template <typename T>
 class IntrusiveLinkedList {
  public:
-  IntrusiveLinkedList() : head_(nullptr), tail_(nullptr) {}
+  IntrusiveLinkedList() noexcept : head_(nullptr), tail_(nullptr) {}
 
-  void push_front(T* t) {
+  void push_front(T* t) noexcept {
+    t->prev = nullptr;
+    t->next = head_;
     if (head_) {
-      t->next = head_;
       head_->prev = t;
     } else {
-      t->next = nullptr;
       tail_ = t;
     }
     head_ = t;
-    head_->prev = nullptr;
   }
 
-  void push_back(T* t) {
+  void push_back(T* t) noexcept {
+    t->next = nullptr;
+    t->prev = tail_;
     if (tail_) {
       tail_->next = t;
-      t->prev = tail_;
     } else {
-      t->prev = nullptr;
       head_ = t;
     }
     tail_ = t;
-    tail_->next = nullptr;
   }
 
-  T* pop_front() {
+  T* pop_front() noexcept {
     T* front = head_;
     if (front) {
       head_ = front->next;
-      front->next = nullptr;
-
       if (head_) {
         head_->prev = nullptr;
+      } else {
+        tail_ = nullptr;
       }
-    }
-
-    if (head_ == nullptr) {
-      tail_ = nullptr;
+      front->next = nullptr;
     }
     return front;
   }
 
-  T* pop_back() {
+  T* pop_back() noexcept {
     T* back = tail_;
     if (back) {
       tail_ = back->prev;
-      back->prev = nullptr;
-
       if (tail_) {
         tail_->next = nullptr;
+      } else {
+        head_ = nullptr;
       }
-    }
-
-    if (tail_ == nullptr) {
-      head_ = nullptr;
+      back->prev = nullptr;
     }
     return back;
   }
 
-  T* peek_front() const { return head_; }
-
-  void remove(T* t) {
-    if (t != head_) {
+  void remove(T* t) noexcept {
+    if (t->prev) {
       t->prev->next = t->next;
     } else {
       head_ = t->next;
     }
-    if (t != tail_) {
+
+    if (t->next) {
       t->next->prev = t->prev;
     } else {
       tail_ = t->prev;
@@ -81,7 +72,9 @@ class IntrusiveLinkedList {
     t->prev = nullptr;
   }
 
-  bool is_empty() const { return head_ == nullptr; }
+  T* peek_front() const noexcept { return head_; }
+  T* peek_back() const noexcept { return tail_; }
+  bool is_empty() const noexcept { return head_ == nullptr; }
 
   IntrusiveLinkedList(const IntrusiveLinkedList&) = delete;
   IntrusiveLinkedList& operator=(const IntrusiveLinkedList&) = delete;
